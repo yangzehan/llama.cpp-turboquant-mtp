@@ -1,0 +1,210 @@
+name: Build Windows HIP package
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_targets:
+        description: "AMD GPU targets, RX 7900 XTX = gfx1100"
+        required: true
+        default: "gfx1100"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  HIPSDK_INSTALLER_VERSION: "26.Q1"
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_BORINGSSL=ON"
+
+jobs:
+  windows-cpu:
+    name: Build Windows CPU base package
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        shell: powershell
+        run: choco install ninja -y
+
+      - name: Build CPU executables
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=OFF ^
+            %CMAKE_ARGS%
+
+          cmake --build build --config Release
+  
+      - name: Package CPU base
+        shell: powershell
+        run: |
+          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload CPU artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-bin-win-cpu-x64
+          path: llama-bin-win-cpu-x64.zip
+          retention-days: 7
+
+  windows-hip:
+    name: Build Windows HIP backend
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Grab rocWMMA package
+        shell: powershell
+        run: |
+          curl.exe -L -o rocwmma.deb "https://repo.radeon.com/rocm/apt/7.2.1/pool/main/r/rocwmma-dev/rocwmma-dev_2.2.0.70201-81~24.04_amd64.deb"
+          7z x rocwmma.deb
+          7z x data.tar
+
+      - name: Cache ROCm Installation
+        id: cache-rocm
+        uses: actions/cache@v5
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: rocm-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
+
+      - name: Install Ninja
+        shell: powershell
+        run: choco install ninja -y
+
+      - name: Install ROCm
+        if: steps.cache-rocm.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Downloading AMD HIP SDK Installer"
+          Invoke-WebRequest `
+            -Uri "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-Win11-For-HIP.exe" `
+            -OutFile "${env:RUNNER_TEMP}\rocm-install.exe"
+
+          Write-Host "Installing AMD HIP SDK"
+          $proc = Start-Process "${env:RUNNER_TEMP}\rocm-install.exe" `
+            -ArgumentList "-install" `
+            -NoNewWindow `
+            -PassThru
+
+          $completed = $proc.WaitForExit(600000)
+          if (-not $completed) {
+            Write-Error "ROCm installation timed out after 10 minutes"
+            $proc.Kill()
+            exit 1
+          }
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "ROCm installation failed with exit code $($proc.ExitCode)"
+            exit 1
+          }
+
+      - name: Verify ROCm
+        shell: powershell
+        run: |
+          $clangPath = Get-ChildItem "C:\Program Files\AMD\ROCm\*\bin\clang.exe" | Select-Object -First 1
+          if (-not $clangPath) {
+            Write-Error "ROCm clang.exe not found"
+            exit 1
+          }
+          & $clangPath.FullName --version
+
+      - name: Build HIP backend
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $env:HIP_PATH = (Resolve-Path "C:\Program Files\AMD\ROCm\*\bin\clang.exe" | Split-Path | Split-Path)
+          $env:CMAKE_PREFIX_PATH = "${env:HIP_PATH}"
+
+          Write-Host "HIP_PATH=$env:HIP_PATH"
+          Write-Host "GPU_TARGETS=${{ inputs.gpu_targets }}"
+
+          cmake -G "Unix Makefiles" -B build -S . `
+            -DCMAKE_C_COMPILER="${env:HIP_PATH}\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\bin\clang++.exe" `
+            -DCMAKE_CXX_FLAGS="-I$($PWD.Path.Replace('\', '/'))/opt/rocm-7.2.1/include/ -Wno-ignored-attributes -Wno-nested-anon-types" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU=OFF `
+            -DGPU_TARGETS="${{ inputs.gpu_targets }}" `
+            -DGGML_HIP_ROCWMMA_FATTN=ON `
+            -DGGML_HIP=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON
+
+          cmake --build build --target ggml-hip -j ${env:NUMBER_OF_PROCESSORS}
+
+          New-Item -ItemType Directory -Force "build\bin\rocblas\library" | Out-Null
+          New-Item -ItemType Directory -Force "build\bin\hipblaslt\library" | Out-Null
+
+          Copy-Item "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\" -Force
+          Copy-Item "${env:HIP_PATH}\bin\libhipblaslt.dll" "build\bin\" -Force
+          Copy-Item "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\" -Force
+          Copy-Item "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\" -Recurse -Force
+          Copy-Item "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\" -Recurse -Force
+
+      - name: Package HIP backend
+        shell: powershell
+        run: |
+          7z a -snl llama-bin-win-hip-backend-x64.zip .\build\bin\*
+
+      - name: Upload HIP artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-bin-win-hip-backend-x64
+          path: llama-bin-win-hip-backend-x64.zip
+          retention-days: 7
+
+  merge-package:
+    name: Merge Windows HIP package
+    runs-on: windows-2022
+    needs:
+      - windows-cpu
+      - windows-hip
+
+    steps:
+      - name: Download CPU artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-bin-win-cpu-x64
+          path: artifacts/cpu
+
+      - name: Download HIP artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-bin-win-hip-backend-x64
+          path: artifacts/hip
+
+      - name: Merge package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+
+          Expand-Archive artifacts/cpu/llama-bin-win-cpu-x64.zip -DestinationPath package -Force
+          Expand-Archive artifacts/hip/llama-bin-win-hip-backend-x64.zip -DestinationPath package -Force
+
+          7z a -snl llama-bin-win-hip-${{ inputs.gpu_targets }}-x64.zip .\package\*
+
+      - name: Upload final Windows HIP package
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-bin-win-hip-${{ inputs.gpu_targets }}-x64
+          path: llama-bin-win-hip-${{ inputs.gpu_targets }}-x64.zip
+          retention-days: 7
