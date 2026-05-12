@@ -86,7 +86,7 @@ jobs:
         shell: powershell
         run: choco install ninja -y
 
-            - name: Install ROCm
+      - name: Install ROCm
         if: steps.cache-rocm.outputs.cache-hit != 'true'
         shell: powershell
         run: |
