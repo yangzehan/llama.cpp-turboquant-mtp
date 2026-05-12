@@ -130,10 +130,20 @@ jobs:
             exit 1
           }
 
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "ROCm installation failed with exit code $($proc.ExitCode)"
+          $proc.Refresh()
+          $exitCode = $proc.ExitCode
+          Write-Host "ROCm installer process exit code: $exitCode"
+
+          Write-Host "Checking ROCm installation..."
+          $clangPath = Get-ChildItem "C:\Program Files\AMD\ROCm\*\bin\clang.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (-not $clangPath) {
+            Write-Error "ROCm installation not found after installer finished. Exit code was: $exitCode"
             exit 1
           }
+
+          Write-Host "ROCm clang found at: $($clangPath.FullName)"
+          & $clangPath.FullName --version
 
           Write-Host "ROCm installation completed"
 
