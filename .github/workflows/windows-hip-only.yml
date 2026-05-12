@@ -86,19 +86,39 @@ jobs:
         shell: powershell
         run: choco install ninja -y
 
-      - name: Install ROCm
+            - name: Install ROCm
         if: steps.cache-rocm.outputs.cache-hit != 'true'
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Downloading AMD HIP SDK Installer"
-          Invoke-WebRequest `
-            -Uri "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-Win11-For-HIP.exe" `
-            -OutFile "${env:RUNNER_TEMP}\rocm-install.exe"
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-Win11-For-HIP.exe"
+          $out = "${env:RUNNER_TEMP}\rocm-install.exe"
 
-          Write-Host "Installing AMD HIP SDK"
-          $proc = Start-Process "${env:RUNNER_TEMP}\rocm-install.exe" `
+          Write-Host "Downloading AMD HIP SDK Installer..."
+          Write-Host "URL: $url"
+          Write-Host "Output: $out"
+
+          curl.exe --fail --location --retry 3 --retry-delay 10 --max-time 900 `
+            --write-out "`nDownloaded %{size_download} bytes in %{time_total}s, speed %{speed_download} bytes/s`n" `
+            -o "$out" `
+            "$url"
+
+          if (!(Test-Path "$out")) {
+            Write-Error "ROCm installer was not downloaded"
+            exit 1
+          }
+
+          $size = (Get-Item "$out").Length
+          Write-Host ("Downloaded installer size: {0:N2} MB" -f ($size / 1MB))
+
+          if ($size -lt 100MB) {
+            Write-Error "ROCm installer looks too small; download likely failed"
+            exit 1
+          }
+
+          Write-Host "Installing AMD HIP SDK..."
+          $proc = Start-Process "$out" `
             -ArgumentList "-install" `
             -NoNewWindow `
             -PassThru
@@ -114,6 +134,8 @@ jobs:
             Write-Error "ROCm installation failed with exit code $($proc.ExitCode)"
             exit 1
           }
+
+          Write-Host "ROCm installation completed"
 
       - name: Verify ROCm
         shell: powershell
